@@ -16,27 +16,21 @@ Angjoo Kanazawa, Aleksander Holynski, Noah Snavely
 ## Clone
 
 Make sure to clone the repository with the submodules by using:
-`git clone --recursive git@github.com:mega-sam/mega-sam.git`
+`git clone --recursive https://github.com/admonakhov/mega-sam_cuda12.git`
 
 ## Instructions for installing dependencies
 
 ### Python Environment
 
-The following codebase was successfully run with Python 3.10, CUDA11.8, and
-Pytorch2.0.1. We suggest installing the library in a virtual environment such as
+The following codebase was successfully run with Python 3.10, CUDA12.4, and
+Pytorch2.5.1. We suggest installing the library in a virtual environment such as
 Anaconda.
 
 1.  To install main libraries, run: \
     `conda env create -f environment.yml`
 
-2.  To install xformers for UniDepth model, follow the instructions from
-    https://github.com/facebookresearch/xformers. If you encounter any
-    installation issue, we suggest installing it from a prebuilt file. For
-    example, for Python 3.10+Cuda11.8+Pytorch2.0.1, run: \
-    `wget https://anaconda.org/xformers/xformers/0.0.22.post7/download/linux-64/xformers-0.0.22.post7-py310_cu11.8.0_pyt2.0.1.tar.bz2`
-
-    `conda install xformers-0.0.22.post7-py310_cu11.8.0_pyt2.0.1.tar.bz2`
-
+2.  xformers has already installed by step 1
+ 
 3.  Compile the extensions for the camera tracking module: \
     `cd base; python setup.py install`
 
@@ -128,4 +122,3 @@ All other materials are licensed under the Creative Commons Attribution 4.0 Inte
 Unless required by applicable law or agreed to in writing, all software and materials distributed here under the Apache 2.0 or CC-BY licenses are distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the licenses for the specific language governing permissions and limitations under those licenses.
 
 This is not an official Google product.
-
