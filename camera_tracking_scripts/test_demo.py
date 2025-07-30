@@ -113,8 +113,9 @@ def save_full_reconstruction(
   """Save full reconstruction."""
   from pathlib import Path
   t = full_traj.shape[0]
-  images = np.array(rgb_list[:t])  # droid.video.images[:t].cpu().numpy()
-  disps = 1.0 / (np.array(senor_depth_list[:t]) + 1e-6)
+
+  images = np.array([np.array(a) for a in rgb_list[:t]])   # droid.video.images[:t].cpu().numpy()
+  disps = 1.0 / (np.array([np.array(a) for a in senor_depth_list[:t]]) + 1e-6)
 
   poses = full_traj  # .cpu().numpy()
   intrinsics = droid.video.intrinsics[:t].cpu().numpy()
