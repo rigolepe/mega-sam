@@ -85,6 +85,131 @@ ALPHA_MOTION = 0.25
 RESIZE_FACTOR = 0.5  # Minimum resolutie voor kwaliteit
 
 
+def plan_overlapping_batches(total_flows, batch_size=100, overlap_ratio=0.25):
+  """Plan batches met overlap voor smooth transitions.
+
+  Args:
+    total_flows: Totaal aantal flows om te verwerken
+    batch_size: Grootte van elke batch
+    overlap_ratio: Fractie overlap tussen batches (0.25 = 25%)
+
+  Returns:
+    List van tuples (start_idx, end_idx) voor elke batch
+  """
+  overlap = int(batch_size * overlap_ratio)
+  stride = batch_size - overlap  # 75 bij 25% overlap
+
+  batches = []
+  for start in range(0, total_flows, stride):
+    end = min(start + batch_size, total_flows)
+    batches.append((start, end))
+    if end >= total_flows:
+      break
+
+  return batches
+
+
+def process_flow_batch(flows_batch, flow_masks_batch, ii, jj, cam_c2w, K, K_inv,
+                       disp_data, uncertainty, grid, H, W, weights):
+  """Process een batch van flows met gewichten.
+
+  Returns:
+    tuple: (loss_flow, loss_d_ratio, total_weight)
+  """
+  batch_size = len(ii)
+
+  # Permute flows voor processing
+  flows_step = flows_batch.permute(0, 2, 3, 1)
+  flow_masks_step = flow_masks_batch.permute(0, 2, 3, 1).squeeze(-1)
+
+  # Bereken camera transformaties
+  cam_1to2 = torch.bmm(
+      torch.linalg.inv(torch.index_select(cam_c2w, dim=0, index=jj)),
+      torch.index_select(cam_c2w, dim=0, index=ii),
+  )
+
+  # Warp disp from target time
+  pixel_locations = grid + flows_step
+  resize_factor = torch.tensor([W - 1.0, H - 1.0]).cuda()[None, None, None, ...]
+  normalized_pixel_locations = 2 * (pixel_locations / resize_factor) - 1.0
+
+  disp_sampled = torch.nn.functional.grid_sample(
+      torch.index_select(disp_data, dim=0, index=jj)[:, None, ...],
+      normalized_pixel_locations,
+      align_corners=True,
+  )
+
+  uu = torch.index_select(uncertainty, dim=0, index=ii).squeeze(1)
+
+  # Depth of reference view
+  ref_depth = 1.0 / torch.clamp(
+      torch.index_select(disp_data, dim=0, index=ii), 1e-3, 1e3
+  )
+
+  grid_h = torch.cat([grid, torch.ones_like(grid[..., 0:1])], dim=-1).unsqueeze(-1)
+
+  # 3D transformatie met frame-by-frame processing
+  rot = cam_1to2[:, None, None, :3, :3]
+  trans = cam_1to2[:, None, None, :3, 3:4]
+
+  pts_3d_tgt_list = []
+  for i in range(batch_size):
+    with torch.cuda.amp.autocast():
+      ref_depth_i = ref_depth[i:i+1]
+      rot_i = rot[i:i+1]
+      trans_i = trans[i:i+1]
+
+      pts_3d_ref_i = ref_depth_i[..., None, None] * (K_inv[None, None, None] @ grid_h)
+      pts_3d_tgt_i = (rot_i @ pts_3d_ref_i) + trans_i
+
+      pts_3d_tgt_list.append(pts_3d_tgt_i.float())
+      del pts_3d_ref_i
+
+  pts_3d_tgt = torch.cat(pts_3d_tgt_list, dim=0)
+  del pts_3d_tgt_list
+
+  depth_tgt = pts_3d_tgt[:, :, :, 2:3, 0]
+  disp_tgt = 1.0 / torch.clamp(depth_tgt, 0.1, 1e3)
+
+  # Flow consistency loss
+  pts_2D_tgt = K[None, None, None] @ pts_3d_tgt
+  flow_masks_step_ = flow_masks_step * (pts_2D_tgt[:, :, :, 2, 0] > 0.1)
+  pts_2D_tgt = pts_2D_tgt[:, :, :, :2, 0] / torch.clamp(
+      pts_2D_tgt[:, :, :, 2:, 0], 1e-3, 1e3
+  )
+
+  disp_sampled = torch.clamp(disp_sampled, 1e-3, 1e2)
+  disp_tgt = torch.clamp(disp_tgt, 1e-3, 1e2)
+
+  # Bereken losses met gewichten
+  ratio = torch.maximum(
+      disp_sampled.squeeze() / disp_tgt.squeeze(),
+      disp_tgt.squeeze() / disp_sampled.squeeze(),
+  )
+  ratio_error = torch.abs(ratio - 1.0)
+
+  # Apply weights voor overlap regions
+  weighted_masks = flow_masks_step_ * weights[:, None, None]
+
+  loss_d_ratio = torch.sum(
+      (ratio_error * uu + ALPHA_MOTION * torch.log(1.0 / uu)) * weighted_masks
+  )
+
+  flow_error = torch.abs(pts_2D_tgt - pixel_locations)
+  loss_flow = torch.sum(
+      (flow_error * uu[..., None] + ALPHA_MOTION * torch.log(1.0 / uu[..., None]))
+      * weighted_masks[..., None]
+  )
+
+  total_weight = torch.sum(weighted_masks)
+
+  # Cleanup
+  del pts_3d_tgt, grid_h
+  torch.cuda.empty_cache()
+
+  return loss_flow, loss_d_ratio, total_weight
+
+
 def consistency_loss(
     cam_c2w,
     K,
@@ -104,168 +229,102 @@ def consistency_loss(
     w_grad=2.0,
     w_normal=4.0,
 ):
-  """Consistency loss - met lazy loading van flows van CPU."""
+  """Consistency loss - met overlappende batches voor alle flows."""
   _, H, W = disp_data.shape
 
   # Check of flows op CPU zijn
   flows_on_cpu = not flows.is_cuda
-  flow_masks_on_cpu = not flow_masks.is_cuda
+
   # mesh grid
   xx = torch.arange(0, W).view(1, -1).repeat(H, 1)
   yy = torch.arange(0, H).view(-1, 1).repeat(1, W)
-  xx = xx.view(1, 1, H, W)  # .repeat(B ,1 ,1 ,1)
-  yy = yy.view(1, 1, H, W)  # .repeat(B ,1 ,1 ,1)
+  xx = xx.view(1, 1, H, W)
+  yy = yy.view(1, 1, H, W)
   grid = (
       torch.cat((xx, yy), 1).float().cuda().permute(0, 2, 3, 1)
-  )  # [None, ...]
+  )
 
-  loss_flow = 0.0  # flow reprojection loss
-  loss_d_ratio = 0.0  # depth consistency loss
-
-  # BELANGRIJK: We hebben flows voor verschillende step sizes [1, 2, 4, 8, 15]
-  # Voor CVD optimization gebruiken we waarschijnlijk alleen step=1 flows
-  # Dit zijn de eerste ~970 flows
-
+  # Gebruik alleen step=1 flows (eerste 970)
   batch_size = len(ii)
-
-  # Controleer of we alleen step=1 flows moeten gebruiken
-  # ii en jj geven aan welke frame pairs we gebruiken
-  # Voor step=1: ii=[0,1,2,...,969], jj=[1,2,3,...,970]
-
   print(f"Total ii/jj pairs: {batch_size}")
 
-  # We verwerken alleen de flows die we werkelijk nodig hebben
-  # Voor nu gebruiken we alleen de eerste 970 (step=1)
   if batch_size > 1000:
-    print(f"WARNING: Using only step=1 flows (first 970 pairs)")
+    print(f"Using only step=1 flows (first 970 pairs)")
     actual_batch_size = min(970, batch_size)
     ii = ii[:actual_batch_size]
     jj = jj[:actual_batch_size]
     batch_size = actual_batch_size
 
-  # Nu kunnen we de flows laden
-  if flows_on_cpu:
-    # Laad flows in chunks om geheugen te besparen
-    MAX_CHUNK = 100
-    if batch_size > MAX_CHUNK:
-      print(f"Processing {batch_size} flows in chunks of {MAX_CHUNK}...")
-      # Voor nu: process alleen eerste chunk als test
-      flows_batch = flows[ii[:MAX_CHUNK].cpu()].cuda()
-      flow_masks_batch = flow_masks[ii[:MAX_CHUNK].cpu()].cuda()
-      # Update ii/jj voor deze chunk
-      ii = ii[:MAX_CHUNK]
-      jj = jj[:MAX_CHUNK]
-      print(f"Loaded first {MAX_CHUNK} flows from CPU to GPU")
-    else:
+  # Plan overlappende batches
+  MAX_CHUNK = 100
+  OVERLAP_RATIO = 0.25
+
+  if batch_size > MAX_CHUNK and flows_on_cpu:
+    batches = plan_overlapping_batches(batch_size, MAX_CHUNK, OVERLAP_RATIO)
+    print(f"Processing {batch_size} flows in {len(batches)} overlapping batches")
+
+    # Accumulators voor gewogen losses
+    total_loss_flow = 0.0
+    total_loss_d_ratio = 0.0
+    total_weight = 0.0
+
+    for batch_idx, (batch_start, batch_end) in enumerate(batches):
+      batch_ii = ii[batch_start:batch_end]
+      batch_jj = jj[batch_start:batch_end]
+      batch_size_local = batch_end - batch_start
+
+      # Weight scheduling voor overlap regions
+      weights = torch.ones(batch_size_local).cuda()
+      if batch_idx > 0 and batch_start < batches[batch_idx-1][1]:
+        # Dit is een overlap region met de vorige batch
+        overlap_size = batches[batch_idx-1][1] - batch_start
+        weights[:overlap_size] *= 0.5  # Verminder gewicht voor overlap
+
+      # Laad flows voor deze batch van CPU
+      flows_batch = flows[batch_ii.cpu()].cuda()
+      flow_masks_batch = flow_masks[batch_ii.cpu()].cuda()
+
+      # Process deze batch
+      loss_flow_batch, loss_d_ratio_batch, batch_weight = process_flow_batch(
+          flows_batch, flow_masks_batch, batch_ii, batch_jj,
+          cam_c2w, K, K_inv, disp_data, uncertainty,
+          grid, H, W, weights
+      )
+
+      # Accumuleer gewogen losses
+      total_loss_flow += loss_flow_batch
+      total_loss_d_ratio += loss_d_ratio_batch
+      total_weight += batch_weight
+
+      # Cleanup batch tensors
+      del flows_batch, flow_masks_batch
+      torch.cuda.empty_cache()
+
+      print(f"  Batch {batch_idx+1}/{len(batches)}: frames {batch_ii[0]}-{batch_ii[-1]}")
+
+    # Normaliseer losses
+    loss_flow = total_loss_flow / (total_weight * 2.0 + 1e-8)
+    loss_d_ratio = total_loss_d_ratio / (total_weight + 1e-8)
+
+  else:
+    # Enkele batch processing (voor kleine datasets of GPU flows)
+    if flows_on_cpu:
       flows_batch = flows[ii.cpu()].cuda()
       flow_masks_batch = flow_masks[ii.cpu()].cuda()
-      print(f"Loaded {batch_size} flows from CPU to GPU")
-  else:
-    flows_batch = flows
-    flow_masks_batch = flow_masks
+    else:
+      flows_batch = flows
+      flow_masks_batch = flow_masks
 
-  flows_step = flows_batch.permute(0, 2, 3, 1)
-  flow_masks_step = flow_masks_batch.permute(0, 2, 3, 1).squeeze(-1)
+    weights = torch.ones(len(ii)).cuda()
+    loss_flow, loss_d_ratio, _ = process_flow_batch(
+        flows_batch, flow_masks_batch, ii, jj,
+        cam_c2w, K, K_inv, disp_data, uncertainty,
+        grid, H, W, weights
+    )
 
-  cam_1to2 = torch.bmm(
-      torch.linalg.inv(torch.index_select(cam_c2w, dim=0, index=jj)),
-      torch.index_select(cam_c2w, dim=0, index=ii),
-  )
-
-  # warp disp from target time
-  pixel_locations = grid + flows_step
-  resize_factor = torch.tensor([W - 1.0, H - 1.0]).cuda()[None, None, None, ...]
-  normalized_pixel_locations = 2 * (pixel_locations / resize_factor) - 1.0
-
-  disp_sampled = torch.nn.functional.grid_sample(
-      torch.index_select(disp_data, dim=0, index=jj)[:, None, ...],
-      normalized_pixel_locations,
-      align_corners=True,
-  )
-
-  uu = torch.index_select(uncertainty, dim=0, index=ii).squeeze(1)
-
-  grid_h = torch.cat([grid, torch.ones_like(grid[..., 0:1])], dim=-1).unsqueeze(
-      -1
-  )
-  # depth of reference view
-  ref_depth = 1.0 / torch.clamp(
-      torch.index_select(disp_data, dim=0, index=ii), 1e-3, 1e3
-  )
-
-  # GEHEUGEN OPTIMALISATIE: Process 3D transformatie per frame
-  batch_size = ref_depth.shape[0]
-
-  rot = cam_1to2[:, None, None, :3, :3]
-  trans = cam_1to2[:, None, None, :3, 3:4]
-
-  # Process frames één voor één om geheugen te besparen
-  pts_3d_tgt_list = []
-
-  for i in range(batch_size):
-    # Process deze frame met mixed precision
-    with torch.cuda.amp.autocast():
-      # Get data voor deze frame
-      ref_depth_i = ref_depth[i:i+1]
-      rot_i = rot[i:i+1]
-      trans_i = trans[i:i+1]
-
-      # 3D transformatie voor deze frame
-      pts_3d_ref_i = ref_depth_i[..., None, None] * (K_inv[None, None, None] @ grid_h)
-      pts_3d_tgt_i = (rot_i @ pts_3d_ref_i) + trans_i
-
-      # Convert terug naar float32 en sla op
-      pts_3d_tgt_list.append(pts_3d_tgt_i.float())
-
-      # Cleanup frame tensors
-      del pts_3d_ref_i
-
-  # Combineer alle frames
-  pts_3d_tgt = torch.cat(pts_3d_tgt_list, dim=0)
-  del pts_3d_tgt_list
-
-  # Clear cache na processing
-  torch.cuda.empty_cache()
-
-  depth_tgt = pts_3d_tgt[:, :, :, 2:3, 0]
-  disp_tgt = 1.0 / torch.clamp(depth_tgt, 0.1, 1e3)
-
-  # flow consistency loss
-  pts_2D_tgt = K[None, None, None] @ pts_3d_tgt
-
-  flow_masks_step_ = flow_masks_step * (pts_2D_tgt[:, :, :, 2, 0] > 0.1)
-  pts_2D_tgt = pts_2D_tgt[:, :, :, :2, 0] / torch.clamp(
-      pts_2D_tgt[:, :, :, 2:, 0], 1e-3, 1e3
-  )
-
-  disp_sampled = torch.clamp(disp_sampled, 1e-3, 1e2)
-  disp_tgt = torch.clamp(disp_tgt, 1e-3, 1e2)
-
-  ratio = torch.maximum(
-      disp_sampled.squeeze() / disp_tgt.squeeze(),
-      disp_tgt.squeeze() / disp_sampled.squeeze(),
-  )
-  ratio_error = torch.abs(ratio - 1.0)  #
-
-  loss_d_ratio += torch.sum(
-      (ratio_error * uu + ALPHA_MOTION * torch.log(1.0 / uu)) * flow_masks_step_
-  ) / (torch.sum(flow_masks_step_) + 1e-8)
-
-  flow_error = torch.abs(pts_2D_tgt - pixel_locations)
-  loss_flow += torch.sum(
-      (
-          flow_error * uu[..., None]
-          + ALPHA_MOTION * torch.log(1.0 / uu[..., None])
-      )
-      * flow_masks_step_[..., None]
-  ) / (torch.sum(flow_masks_step_) * 2.0 + 1e-8)
-
-  # Vrij grote tensors
-  del pts_3d_tgt, grid_h
-  # Vrij flows van GPU als ze van CPU kwamen
-  if flows_on_cpu:
-    del flows_batch, flow_masks_batch
-  torch.cuda.empty_cache()
+    if flows_on_cpu:
+      del flows_batch, flow_masks_batch
+      torch.cuda.empty_cache()
 
   # prior mono-depth reg loss
   loss_prior = si_loss(init_disp, disp_data)
