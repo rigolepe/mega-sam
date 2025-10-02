@@ -223,6 +223,7 @@ def consistency_loss(
     jj,
     compute_normals,
     fg_alpha,
+    args=None,
     w_ratio=1.0,
     w_flow=0.2,
     w_si=1.0,
@@ -244,29 +245,59 @@ def consistency_loss(
       torch.cat((xx, yy), 1).float().cuda().permute(0, 2, 3, 1)
   )
 
-  # Gebruik alleen step=1 flows (eerste 970)
+  # Filter flows op basis van use_multiscale parameter
   batch_size = len(ii)
   print(f"Total ii/jj pairs: {batch_size}")
 
+  # Bepaal welke flows te gebruiken op basis van multiscale configuratie
   if batch_size > 1000:
-    print(f"Using only step=1 flows (first 970 pairs)")
-    actual_batch_size = min(970, batch_size)
-    ii = ii[:actual_batch_size]
-    jj = jj[:actual_batch_size]
-    batch_size = actual_batch_size
+    # Bereken step sizes voor elk flow pair
+    steps = jj - ii
+
+    multiscale_mode = args.multiscale_flows if args is not None else "none"
+
+    if multiscale_mode == "full":
+      print(f"Multi-scale flows FULL: using all {batch_size} flow pairs (step 1/2/4/8/15)")
+      print(f"  Step sizes: {torch.unique(steps).cpu().numpy()}")
+      # Gebruik alle flows zonder filtering
+    elif multiscale_mode == "medium":
+      print(f"Multi-scale flows MEDIUM: filtering for step 1/2/4")
+      step_mask = (steps == 1) | (steps == 2) | (steps == 4)
+      ii = ii[step_mask]
+      jj = jj[step_mask]
+      batch_size = len(ii)
+      print(f"  Using {batch_size} flow pairs (step 1/2/4)")
+      print(f"  Step sizes: {torch.unique(steps[step_mask]).cpu().numpy()}")
+    else:  # none
+      print(f"Multi-scale flows NONE: using only step=1 flows")
+      step_mask = (steps == 1)
+      ii = ii[step_mask]
+      jj = jj[step_mask]
+      batch_size = len(ii)
+      print(f"  Using {batch_size} step=1 flow pairs")
+  else:
+    print(f"Small dataset ({batch_size} flows), using all flows")
 
   # Plan overlappende batches
-  MAX_CHUNK = 100
-  OVERLAP_RATIO = 0.25
+  MAX_CHUNK = 25
+  OVERLAP_RATIO = 0.10
 
   if batch_size > MAX_CHUNK and flows_on_cpu:
     batches = plan_overlapping_batches(batch_size, MAX_CHUNK, OVERLAP_RATIO)
     print(f"Processing {batch_size} flows in {len(batches)} overlapping batches")
 
+    # Strategie: bereken slechts 1 batch met gradient, rest zonder
+    # Dit behoudt gradient flow maar beperkt geheugengebruik drastisch
+    import gc
+
     # Accumulators voor gewogen losses
-    total_loss_flow = 0.0
-    total_loss_d_ratio = 0.0
-    total_weight = 0.0
+    total_loss_flow_value = 0.0  # Scalar accumulator
+    total_loss_d_ratio_value = 0.0
+    total_weight_value = 0.0
+
+    # Voor gradiënten: gebruik alleen laatste batch (representatief sample)
+    loss_flow_with_grad = None
+    loss_d_ratio_with_grad = None
 
     for batch_idx, (batch_start, batch_end) in enumerate(batches):
       batch_ii = ii[batch_start:batch_end]
@@ -284,27 +315,43 @@ def consistency_loss(
       flows_batch = flows[batch_ii.cpu()].cuda()
       flow_masks_batch = flow_masks[batch_ii.cpu()].cuda()
 
-      # Process deze batch
-      loss_flow_batch, loss_d_ratio_batch, batch_weight = process_flow_batch(
-          flows_batch, flow_masks_batch, batch_ii, batch_jj,
-          cam_c2w, K, K_inv, disp_data, uncertainty,
-          grid, H, W, weights
-      )
+      # Bepaal of we gradiënten willen voor deze batch
+      # Alleen laatste batch houdt gradient graph
+      is_last_batch = (batch_idx == len(batches) - 1)
 
-      # Accumuleer gewogen losses
-      total_loss_flow += loss_flow_batch
-      total_loss_d_ratio += loss_d_ratio_batch
-      total_weight += batch_weight
+      with torch.set_grad_enabled(is_last_batch):
+        # Process deze batch
+        loss_flow_batch, loss_d_ratio_batch, batch_weight = process_flow_batch(
+            flows_batch, flow_masks_batch, batch_ii, batch_jj,
+            cam_c2w, K, K_inv, disp_data, uncertainty,
+            grid, H, W, weights
+        )
 
-      # Cleanup batch tensors
-      del flows_batch, flow_masks_batch
+        if is_last_batch:
+          # Laatste batch: bewaar voor gradiënten
+          loss_flow_with_grad = loss_flow_batch
+          loss_d_ratio_with_grad = loss_d_ratio_batch
+          total_weight_value += batch_weight if not isinstance(batch_weight, torch.Tensor) else batch_weight.item()
+        else:
+          # Andere batches: alleen scalar waarde voor statistieken
+          total_loss_flow_value += loss_flow_batch.item()
+          total_loss_d_ratio_value += loss_d_ratio_batch.item()
+          total_weight_value += batch_weight if not isinstance(batch_weight, torch.Tensor) else batch_weight.item()
+
+      # Cleanup batch tensors en computational graph
+      del flows_batch, flow_masks_batch, loss_flow_batch, loss_d_ratio_batch
       torch.cuda.empty_cache()
+      gc.collect()
 
       print(f"  Batch {batch_idx+1}/{len(batches)}: frames {batch_ii[0]}-{batch_ii[-1]}")
 
-    # Normaliseer losses
-    loss_flow = total_loss_flow / (total_weight * 2.0 + 1e-8)
-    loss_d_ratio = total_loss_d_ratio / (total_weight + 1e-8)
+    # Gebruik laatste batch als representatieve gradient, geschaald naar gemiddelde
+    # Dit behoudt gradient flow maar voorkomt geheugen accumulatie
+    avg_loss_flow = total_loss_flow_value / len(batches) if len(batches) > 1 else 0
+    avg_loss_d_ratio = total_loss_d_ratio_value / len(batches) if len(batches) > 1 else 0
+
+    loss_flow = (loss_flow_with_grad + avg_loss_flow) / (total_weight_value * 2.0 + 1e-8)
+    loss_d_ratio = (loss_d_ratio_with_grad + avg_loss_d_ratio) / (total_weight_value + 1e-8)
 
   else:
     # Enkele batch processing (voor kleine datasets of GPU flows)
@@ -384,10 +431,21 @@ if __name__ == "__main__":
       "--output_dir", type=str, default="outputs_cvd", help="outputs direcotry"
   )
   parser.add_argument("--scene_name", type=str, help="scene name")
+  parser.add_argument(
+      "--multiscale_flows",
+      type=str,
+      default="none",
+      choices=["none", "medium", "full"],
+      help="Multi-scale flows: none=step1, medium=1/2/4, full=1/2/4/8/15"
+  )
+  parser.add_argument(
+      "--cache_dir", type=str, default="./cache_flow",
+      help="Directory for optical flow cache"
+  )
 
   args = parser.parse_args()
 
-  cache_dir = "./cache_flow"
+  cache_dir = args.cache_dir
   rootdir = os.getcwd() + "/reconstructions"
 
   output_dir = args.output_dir
@@ -548,6 +606,7 @@ if __name__ == "__main__":
         jj,
         compute_normals,
         fg_alpha,
+        args=args,
     )
 
     loss.backward()
@@ -599,6 +658,7 @@ if __name__ == "__main__":
         jj,
         compute_normals,
         fg_alpha,
+        args=args,
         w_ratio=1.0,
         w_flow=0.2,
         w_si=1,

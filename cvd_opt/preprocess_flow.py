@@ -65,6 +65,8 @@ if __name__ == '__main__':
   parser.add_argument('--small', action='store_true', help='use small model')
   parser.add_argument('--scene_name', type=str, help='use small model')
   parser.add_argument('--datapath')
+  parser.add_argument('--cache_dir', type=str, default='./cache_flow',
+                     help='Directory for optical flow cache')
 
   parser.add_argument('--path', help='dataset for evaluation')
   parser.add_argument(
@@ -88,7 +90,22 @@ if __name__ == '__main__':
   parser.add_argument(
       '--mixed_precision', action='store_true', help='use mixed precision'
   )
+  parser.add_argument(
+      '--flow_steps',
+      type=str,
+      default='full',
+      choices=['medium', 'full'],
+      help='Multi-scale flow steps: medium=[1,2,4] of full=[1,2,4,8,15]'
+  )
   args = parser.parse_args()
+
+  # Bepaal flow steps op basis van configuratie
+  if args.flow_steps == 'medium':
+    flow_steps = [1, 2, 4]
+  else:  # full
+    flow_steps = [1, 2, 4, 8, 15]
+
+  print(f'Using flow steps: {flow_steps}')
 
   model = torch.nn.DataParallel(RAFT(args))
   model.load_state_dict(torch.load(args.model))
@@ -131,7 +148,7 @@ if __name__ == '__main__':
   flows_arr_up = []
   masks_arr_up = []
 
-  for step in [1, 2, 4, 8, 15]:
+  for step in flow_steps:
     flows_arr_low = []
     for i in tqdm.tqdm(range(max(0, -step), img_data.shape[0] - max(0, step))):
       image1 = (
@@ -203,7 +220,8 @@ if __name__ == '__main__':
   iijj = np.stack((ii, jj), axis=0)
   flows_high = np.array(flows_arr_up).transpose(0, 3, 1, 2)
   flow_masks_high = np.array(masks_arr_up)[:, None, ...]
-  Path('./cache_flow/%s' % scene_name).mkdir(parents=True, exist_ok=True)
-  np.save('./cache_flow/%s/flows.npy' % scene_name, np.float16(flows_high))
-  np.save('./cache_flow/%s/flows_masks.npy' % scene_name, flow_masks_high)
-  np.save('./cache_flow/%s/ii-jj.npy' % scene_name, iijj)
+  cache_dir = args.cache_dir
+  Path('%s/%s' % (cache_dir, scene_name)).mkdir(parents=True, exist_ok=True)
+  np.save('%s/%s/flows.npy' % (cache_dir, scene_name), np.float16(flows_high))
+  np.save('%s/%s/flows_masks.npy' % (cache_dir, scene_name), flow_masks_high)
+  np.save('%s/%s/ii-jj.npy' % (cache_dir, scene_name), iijj)
